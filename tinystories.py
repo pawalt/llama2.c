@@ -21,6 +21,7 @@ from tqdm import tqdm
 from tokenizer import Tokenizer
 
 DATA_CACHE_DIR = "data"
+TRAINING_DATA_DIR = "/Users/peyton/projects/sqlpilot/data/training_data"
 
 def download_file(url: str, fname: str, chunk_size=1024):
     """Helper function to download a file from a given url"""
@@ -76,16 +77,23 @@ def train_vocab(vocab_size):
     """
     assert vocab_size > 0, "Vocab size must be positive"
 
+    os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+
     # output file prefix path for sentencepiece
     prefix = os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}")
 
     # how many shards we'll use for vocab training, kept low for efficiency
-    num_shards = 10
+    num_shards = 1000
 
     # 1) export a large chunk of text as a single text file tiny.txt
     tiny_file = os.path.join(DATA_CACHE_DIR, "tiny.txt")
-    data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
-    shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
+    data_dir = TRAINING_DATA_DIR
+
+    shard_filenames = sorted(glob.glob(f"{data_dir}/**/*.json", recursive=True))
+    print(f"Found {len(shard_filenames)} shard files in {data_dir}")
+
+    # shuffle the shards to get a random sample
+    random.shuffle(shard_filenames)
 
     print(f"Writing temporary file {tiny_file} with {num_shards} shards...")
     with open(tiny_file, "w", encoding="utf-8") as of:
@@ -93,9 +101,8 @@ def train_vocab(vocab_size):
             with open(shard, "r") as f:
                 data = json.load(f)
             for example in data:
-                text = example["story"]
-                text = text.strip()
-                of.write(text + "\n")
+                of.write(example.strip() + "\n\n")
+
     print(f"Size is: {os.path.getsize(tiny_file) / 1024 / 1024:.2f} MB")
 
     # 2) train the sentencepiece model
@@ -128,27 +135,44 @@ def process_shard(args, vocab_size):
     shard_id, shard = args
     tokenizer_model = get_tokenizer_model_path(vocab_size)
     enc = Tokenizer(tokenizer_model)
+
     with open(shard, "r") as f:
-        data = json.load(f)
+        data = f.read()
+
+    # need this in pretok so i generate samples that fit into the model
+    MAX_SEQ_LEN = 512
+
     all_tokens = []
-    for example in tqdm(data, position=shard_id):
-        text = example["story"]
-        text = text.strip()  # get rid of leading/trailing whitespace
-        tokens = enc.encode(text, bos=True, eos=False)  # encode the text, use BOS
+    all_examples = json.loads(data)  # split into examples
+    for ex in all_examples:
+        # encode the text, use BOS and EOS to clip off the padding i'm gonna add
+        tokens = enc.encode(ex, bos=True, eos=True)
+        # clip to max sequence length
+        tokens = tokens[:MAX_SEQ_LEN]
+        # pad to max sequence length
+        tokens = tokens + [enc.pad_id] * (MAX_SEQ_LEN - len(tokens))
+
         all_tokens.extend(tokens)
+
     # convert to uint16 nparray
     all_tokens = np.array(all_tokens, dtype=np.uint16)
     # calculate the output filename
     if vocab_size == 0:
-        # if we're using Llama 2, just save the tokenized file in the same dir
-        tokenized_filename = shard.replace(".json", ".bin")
+        # if we're using Llama 2, use same filename but in data cache dir/custom
+        bin_dir = os.path.join(DATA_CACHE_DIR, "custom")
+        shard_basename = os.path.basename(shard)
+        bin_basename = shard_basename.replace(".json", ".bin")
+        tokenized_filename = os.path.join(bin_dir, bin_basename)
     else:
         # save .bin files into a new tok{N} directory
         bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}")
         shard_basename = os.path.basename(shard)
+        shard_relpath = shard.lstrip(TRAINING_DATA_DIR).rstrip(shard_basename)
         bin_basename = shard_basename.replace(".json", ".bin")
-        tokenized_filename = os.path.join(bin_dir, bin_basename)
+        tokenized_filename = os.path.join(bin_dir, shard_relpath, bin_basename)
     # write the bytes
+    # ensure dir exists
+    os.makedirs(os.path.dirname(tokenized_filename), exist_ok=True)
     with open(tokenized_filename, "wb") as f:
         f.write(all_tokens.tobytes())
     # calculate the average sequence length (they are separated by BOS=1)
@@ -158,8 +182,9 @@ def process_shard(args, vocab_size):
 
 def pretokenize(vocab_size):
     # iterate the shards and tokenize all of them one by one
-    data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
-    shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
+    data_dir = TRAINING_DATA_DIR
+    shard_filenames = sorted(glob.glob(f"{data_dir}/*.json"))
+
     if vocab_size > 0:
         # .bin files will be saved into tok{N} directory, create it once here
         bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{vocab_size}")
@@ -194,14 +219,24 @@ class PretokDataset(torch.utils.data.IterableDataset):
         print(f"Created a PretokDataset with rng seed {seed}")
         if self.vocab_source == "llama2":
             # the .bin files are right along the .json files
-            bin_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
+            bin_dir = os.path.join(DATA_CACHE_DIR, "custom")
             shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
         elif self.vocab_source == "custom":
             # the .bin files are in tok{N} directory
             bin_dir = os.path.join(DATA_CACHE_DIR, f"tok{self.vocab_size}")
-            shard_filenames = sorted(glob.glob(os.path.join(bin_dir, "*.bin")))
-        # train/test split. let's use only shard 0 for test split, rest train
-        shard_filenames = shard_filenames[1:] if self.split == "train" else shard_filenames[:1]
+            shard_filenames = sorted(glob.glob(f"{bin_dir}/**/*.bin", recursive=True))
+
+        # train/test split. randomly select 90% of the shards for training. use seed for reproducibility
+        #   shuffle_rng = random.Random()
+        #   shuffle_rng.seed(42)
+        #   shuffle_rng.shuffle(shard_filenames)
+        #   # slice off a bunch of training data for now. just do 50% of it so i can get a basic test going
+        #   shard_filenames = shard_filenames[:int(0.5 * len(shard_filenames))]
+        if self.split == "train":
+            shard_filenames = shard_filenames[:int(0.9 * len(shard_filenames))]
+        else:
+            shard_filenames = shard_filenames[int(0.9 * len(shard_filenames)):]
+
         assert len(shard_filenames)>0, f"No bin files found in {bin_dir}"
         while True:
             rng.shuffle(shard_filenames)

@@ -31,10 +31,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tinystories import Task
 from export import model_export
 
+# need because can still use mps
+from torch._dynamo import config
+config.suppress_errors=True
+
 # -----------------------------------------------------------------------------
 # I/O
 out_dir = "out"
-eval_interval = 2000
+eval_interval = 100
 log_interval = 1
 eval_iters = 100
 eval_only = False  # if True, script exits right after the first eval
@@ -45,15 +49,35 @@ wandb_log = False  # disabled by default
 wandb_project = "llamac"
 wandb_run_name = "run" + datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 # data
-batch_size = 128  # if gradient_accumulation_steps > 1, this is the micro-batch size
-max_seq_len = 256
+# i have 1261 total files. so in order to not overfit, i should set my batch
+# size relatively large. it should at least cover one set of statements (so 1261/100 = 12)
+batch_size = 32  # if gradient_accumulation_steps > 1, this is the micro-batch size
+
+# PEYTON CONFIG ---------------------
 vocab_source = "llama2" # llama2|custom; use Lllama 2 vocab from Meta, or custom trained
-vocab_size = 32000 # the Llama 2 tokenizer has 32K tokens
-# model
+vocab_size = 32000
+max_seq_len = 512
+
+# 42M model
+# dim = 512
+# n_layers = 8
+# n_heads = 8
+# n_kv_heads = 8
+
+# 15M model
 dim = 288
 n_layers = 6
 n_heads = 6
 n_kv_heads = 6
+
+# start with 260k model. bad results here. never got to a good place
+# https://github.com/pawalt/llama2.c?tab=readme-ov-file#models
+# dim = 64
+# n_layers = 5
+# n_heads = 8
+# n_kv_heads = 4
+# -----------------------------------
+
 multiple_of = 32
 dropout = 0.0
 # adamw optimizer
@@ -68,7 +92,7 @@ grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
 decay_lr = True  # whether to decay the learning rate
 warmup_iters = 1000  # how many steps to warm up for
 # system
-device = "cuda"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
+device = "mps"  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = "bfloat16"  # float32|bfloat16|float16
 compile = True  # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
